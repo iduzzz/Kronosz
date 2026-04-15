@@ -1,137 +1,336 @@
 #!/usr/bin/env python3
 """
-KRONOS AI FORECAST — CLOUD VERSION
-===================================
-Runs on Render.com free tier.
-Accessible from any device including iPhone.
+KRONOS WEB APP
+==============
+Run once: python kronos_app.py
+Then open: http://localhost:5000
 """
 
-from flask import Flask, request, jsonify, render_template_string
-import json, os, requests as req
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import json, os, sys, threading, webbrowser, urllib.parse, requests
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-app = Flask(__name__)
-
-OPENAI_KEY  = os.environ.get("OPENAI_API_KEY", "")
-GROK_KEY    = os.environ.get("XAI_API_KEY", "")
+CLAUDE_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "")
+GROK_KEY     = os.environ.get("XAI_API_KEY", "")
 GEMINI_KEY   = os.environ.get("GEMINI_API_KEY", "")
 MISTRAL_KEY  = os.environ.get("MISTRAL_API_KEY", "")
-CLAUDE_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 BINANCE     = "https://api.binance.com/api/v3"
+PORT        = 5000
+
+# Paths relative to script location
+import pathlib
+BASE_DIR = pathlib.Path(__file__).parent.resolve()
+CODE_DIR  = str(BASE_DIR / "kronos_code")
+MODEL_DIR = str(BASE_DIR / "kronos_model")
+
+# try loading Kronos model at startup
+KRONOS_PREDICTOR = None
+def load_kronos_model():
+    global KRONOS_PREDICTOR
+    if not os.path.isdir(CODE_DIR):
+        print(f"  Kronos code directory not found at {CODE_DIR}")
+        return False
+    try:
+        sys.path.insert(0, CODE_DIR)
+        import torch, numpy as np, pandas as pd
+        from model import Kronos, KronosTokenizer, KronosPredictor
+        tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base", cache_dir=MODEL_DIR)
+        model     = Kronos.from_pretrained("NeoQuasar/Kronos-base", cache_dir=MODEL_DIR)
+        KRONOS_PREDICTOR = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
+        print(f"  Kronos-base: OK (102M parameters)")
+        return True
+    except Exception as e:
+        print(f"  Kronos-base: NOT AVAILABLE ({e})")
+        return False
 
 MS_MAP   = {"5m":300000,"15m":900000,"30m":1800000,"1h":3600000,"4h":14400000,"1d":86400000}
 IV_LABEL = {"5m":"next 2h","15m":"next 6h","30m":"next 12h","1h":"next 24h","4h":"next 4d","1d":"next 2w"}
+KUCOIN   = "https://api.kucoin.com/api/v1"
+
+# Coins that use KuCoin instead of Binance
+KUCOIN_SYMBOLS = {"CPOOLUSDT", "NPCUSDT", "TELUSDT"}
 
 # ── DATA ──────────────────────────────────────────────────────────────────────
 def fetch_klines(symbol, interval, limit=80):
-    r = req.get(f"{BINANCE}/klines",
-                params={"symbol":symbol,"interval":interval,"limit":limit},timeout=15)
+    if symbol in KUCOIN_SYMBOLS:
+        return fetch_klines_kucoin(symbol, interval, limit)
+    r = requests.get(f"{BINANCE}/klines",
+                     params={"symbol":symbol,"interval":interval,"limit":limit},timeout=15)
     r.raise_for_status()
     return [{"t":k[0],"o":float(k[1]),"h":float(k[2]),"l":float(k[3]),"c":float(k[4]),"v":float(k[5])} for k in r.json()]
 
+def fetch_klines_kucoin(symbol, interval, limit=80):
+    # KuCoin uses different interval format and symbol format
+    iv_map = {"5m":"5min","15m":"15min","30m":"30min","1h":"1hour","4h":"4hour","1d":"1day"}
+    kc_iv  = iv_map.get(interval, "1hour")
+    # KuCoin symbol format: CPOOL-USDT
+    kc_sym = symbol.replace("USDT", "-USDT")
+    r = requests.get(f"{KUCOIN}/market/candles",
+                     params={"symbol":kc_sym,"type":kc_iv},timeout=15)
+    r.raise_for_status()
+    data = r.json().get("data")
+    if not data:
+        raise Exception(f"No candle data from KuCoin for {symbol}")
+    # KuCoin returns [time, open, close, high, low, volume, turnover] newest first
+    result = []
+    for k in reversed(data[:limit]):
+        result.append({
+            "t": int(k[0]) * 1000,
+            "o": float(k[1]),
+            "c": float(k[2]),
+            "h": float(k[3]),
+            "l": float(k[4]),
+            "v": float(k[5])
+        })
+    return result
+
 def fetch_ticker(symbol):
-    r = req.get(f"{BINANCE}/ticker/24hr",params={"symbol":symbol},timeout=15)
+    if symbol in KUCOIN_SYMBOLS:
+        return fetch_ticker_kucoin(symbol)
+    r = requests.get(f"{BINANCE}/ticker/24hr",params={"symbol":symbol},timeout=15)
     r.raise_for_status()
     return r.json()
 
-def time_label(ts_ms, interval):
-    dt = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc)
-    if interval == "1d":               return dt.strftime("%b %d")
-    if interval in ("5m","15m","30m"): return dt.strftime("%H:%M")
-    return dt.strftime("%m/%d %H:%M")
+def fetch_ticker_kucoin(symbol):
+    kc_sym = symbol.replace("USDT", "-USDT")
+    r = requests.get(f"{KUCOIN}/market/stats",params={"symbol":kc_sym},timeout=15)
+    r.raise_for_status()
+    d = r.json()["data"]
+    last  = float(d["last"] or 0)
+    open_ = float(d["open"]) if d.get("open") else last
+    chg   = ((last - open_) / open_ * 100) if open_ and open_ != last else 0
+    return {
+        "lastPrice":          str(last),
+        "priceChangePercent": str(round(chg, 2)),
+        "highPrice":          str(float(d["high"]) if d.get("high") else last),
+        "lowPrice":           str(float(d["low"])  if d.get("low")  else last),
+        "quoteVolume":        str(float(d["volValue"]) if d.get("volValue") else 0),
+    }
 
-# ── PROMPT ────────────────────────────────────────────────────────────────────
-def build_prompt(symbol, interval, klines, ticker):
+# ── TECHNICAL INDICATORS ──────────────────────────────────────────────────────
+def calc_indicators(klines):
+    closes = [k["c"] for k in klines]
+    highs  = [k["h"] for k in klines]
+    lows   = [k["l"] for k in klines]
+    vols   = [k["v"] for k in klines]
+
+    # RSI 14
+    gains, losses = [], []
+    for i in range(1, min(15, len(closes))):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d,0)); losses.append(max(-d,0))
+    ag = sum(gains)/len(gains) if gains else 0
+    al = sum(losses)/len(losses) if losses else 0.001
+    rsi = round(100 - (100/(1+ag/al)), 1)
+
+    # MACD (12/26/9)
+    def ema(data, period):
+        k = 2/(period+1); e = data[0]
+        for v in data[1:]: e = v*k + e*(1-k)
+        return e
+    if len(closes) >= 26:
+        ema12 = ema(closes[-26:], 12)
+        ema26 = ema(closes[-26:], 26)
+        macd  = round(ema12 - ema26, 6)
+    else:
+        macd = 0
+
+    # Bollinger Bands 20
+    recent = closes[-20:]
+    bb_mid = sum(recent)/len(recent)
+    bb_std = (sum((x-bb_mid)**2 for x in recent)/len(recent))**0.5
+    bb_upper = round(bb_mid + 2*bb_std, 4)
+    bb_lower = round(bb_mid - 2*bb_std, 4)
+    bb_mid   = round(bb_mid, 4)
+    price    = closes[-1]
+    bb_pos   = round((price - bb_lower)/(bb_upper - bb_lower)*100, 1) if bb_upper != bb_lower else 50
+
+    # Volume analysis
+    avg_vol  = sum(vols[-20:])/20 if len(vols)>=20 else sum(vols)/len(vols)
+    cur_vol  = vols[-1]
+    vol_ratio = round(cur_vol/avg_vol, 2) if avg_vol else 1
+
+    # Support/Resistance from recent highs/lows
+    recent_highs = sorted(highs[-20:], reverse=True)
+    recent_lows  = sorted(lows[-20:])
+    r1 = round(recent_highs[0], 4)
+    r2 = round(recent_highs[2], 4)
+    s1 = round(recent_lows[0], 4)
+    s2 = round(recent_lows[2], 4)
+
+    # Trend strength
+    sma20 = sum(closes[-20:])/20
+    sma50 = sum(closes[-50:])/50 if len(closes)>=50 else sma20
+    trend = "bullish" if closes[-1] > sma20 > sma50 else "bearish" if closes[-1] < sma20 < sma50 else "neutral"
+
+    # ATR 14
+    tr_list = []
+    for i in range(1, min(15, len(closes))):
+        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        tr_list.append(tr)
+    atr = round(sum(tr_list)/len(tr_list), 4) if tr_list else 0
+
+    return {
+        "rsi": rsi, "macd": macd, "macd_signal": "bullish" if macd>0 else "bearish" if macd<0 else "neutral",
+        "bb_upper": bb_upper, "bb_mid": bb_mid, "bb_lower": bb_lower, "bb_position_pct": bb_pos,
+        "vol_ratio": vol_ratio, "vol_signal": "high" if vol_ratio>1.5 else "low" if vol_ratio<0.5 else "normal",
+        "support_1": s1, "support_2": s2, "resistance_1": r1, "resistance_2": r2,
+        "trend": trend, "sma20": round(sma20,4), "sma50": round(sma50,4), "atr": atr
+    }
+
+# ── FEAR & GREED INDEX ────────────────────────────────────────────────────────
+def fetch_fear_greed():
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8)
+        d = r.json()["data"][0]
+        return {"value": int(d["value"]), "label": d["value_classification"]}
+    except:
+        return {"value": 50, "label": "Neutral"}
+
+# ── ENRICHED PROMPT BUILDER ───────────────────────────────────────────────────
+def build_ai_prompt(symbol, interval, klines, ticker, indicators=None, fear_greed=None):
     last20 = klines[-20:]
     rows = []
     for i,k in enumerate(last20):
         chg = ((k["c"]-last20[i-1]["c"])/last20[i-1]["c"]*100) if i>0 else 0.0
-        rows.append(f"[{i+1:02d}] O:{k['o']:.4f} H:{k['h']:.4f} L:{k['l']:.4f} C:{k['c']:.4f} chg:{chg:+.2f}%")
-    system = """You are an expert quantitative crypto analyst. Analyze OHLCV candlestick data and return ONLY a valid JSON object. No markdown, no backticks, no explanation.
-Schema: {"bullish_probability":<0-100>,"volatility_probability":<0-100>,"trend":"bullish"|"bearish"|"neutral","sentiment":"strong buy"|"buy"|"neutral"|"sell"|"strong sell","key_levels":{"support_1":<n>,"support_2":<n>,"resistance_1":<n>,"resistance_2":<n>},"forecast_candles":[{"mean":<n>,"high":<n>,"low":<n>}],"rsi_estimate":<0-100>,"macd_signal":"bullish"|"bearish"|"neutral","risk_level":"low"|"medium"|"high"|"extreme","target_price":<n>,"stop_loss":<n>,"analysis":"<3-4 sentences>","short_summary":"<1 sentence>"}
+        rows.append(f"[{i+1:02d}] O:{k['o']:.4f} H:{k['h']:.4f} L:{k['l']:.4f} C:{k['c']:.4f} V:{k['v']:.0f} chg:{chg:+.2f}%")
+
+    ind = indicators or {}
+    fg  = fear_greed or {"value":50,"label":"Neutral"}
+
+    tech_block = f"""
+TECHNICAL INDICATORS (pre-calculated):
+  RSI(14): {ind.get('rsi','N/A')} {'→ OVERBOUGHT' if ind.get('rsi',50)>70 else '→ OVERSOLD' if ind.get('rsi',50)<30 else '→ neutral zone'}
+  MACD: {ind.get('macd','N/A')} ({ind.get('macd_signal','neutral')})
+  Bollinger Bands: Lower={ind.get('bb_lower','N/A')} Mid={ind.get('bb_mid','N/A')} Upper={ind.get('bb_upper','N/A')}
+  BB Position: {ind.get('bb_position_pct','N/A')}% (0%=lower band, 100%=upper band)
+  SMA20: {ind.get('sma20','N/A')} | SMA50: {ind.get('sma50','N/A')}
+  ATR(14): {ind.get('atr','N/A')} (volatility measure)
+  Volume ratio vs 20-avg: {ind.get('vol_ratio','N/A')}x ({ind.get('vol_signal','normal')} volume)
+  Trend structure: {ind.get('trend','N/A').upper()}
+  Key Support: {ind.get('support_1','N/A')} / {ind.get('support_2','N/A')}
+  Key Resistance: {ind.get('resistance_1','N/A')} / {ind.get('resistance_2','N/A')}
+
+MARKET SENTIMENT:
+  Fear & Greed Index: {fg['value']}/100 — {fg['label']}
+  {'→ Extreme greed often precedes corrections' if fg['value']>75 else '→ Extreme fear often precedes recoveries' if fg['value']<25 else '→ Neutral market mood'}"""
+
+    system = """You are a professional quantitative crypto analyst with expertise in technical analysis, market microstructure, and risk management. You have access to pre-calculated technical indicators, volume analysis, and market sentiment data. Use ALL provided data to generate a comprehensive, accurate forecast. Return ONLY a valid JSON object with no markdown, no backticks, no explanation.
+
+Schema: {"bullish_probability":<0-100>,"volatility_probability":<0-100>,"trend":"bullish"|"bearish"|"neutral","sentiment":"strong buy"|"buy"|"neutral"|"sell"|"strong sell","key_levels":{"support_1":<n>,"support_2":<n>,"resistance_1":<n>,"resistance_2":<n>},"forecast_candles":[{"mean":<n>,"high":<n>,"low":<n>}],"rsi_estimate":<0-100>,"macd_signal":"bullish"|"bearish"|"neutral","risk_level":"low"|"medium"|"high"|"extreme","target_price":<n>,"stop_loss":<n>,"analysis":"<4-5 sentences covering: trend structure, momentum indicators, volume confirmation, key risk levels, and actionable insight>","short_summary":"<1 concise sentence with specific price levels>"}
 forecast_candles must have exactly 8 entries. Return ONLY the JSON."""
-    user = (f"Symbol:{symbol} Interval:{interval} Price:{float(ticker['lastPrice']):.4f}\n"
-            f"24h chg:{float(ticker['priceChangePercent']):.2f}% H:{float(ticker['highPrice']):.4f} L:{float(ticker['lowPrice']):.4f}\n"
-            f"Last 20 candles:\n"+"\n".join(rows)+f"\nForecast {IV_LABEL[interval]}. JSON only.")
+
+    user = (f"Symbol:{symbol} | Interval:{interval} | Forecast horizon: {IV_LABEL[interval]}\n"
+            f"Current price: {float(ticker['lastPrice']):.4f} USDT\n"
+            f"24h change: {float(ticker['priceChangePercent']):.2f}% | 24h High: {float(ticker['highPrice']):.4f} | 24h Low: {float(ticker['lowPrice']):.4f}\n"
+            f"24h volume: {float(ticker['quoteVolume']):.0f} USDT\n"
+            f"{tech_block}\n\n"
+            f"OHLCV Candles (last 20, oldest to newest):\n" + "\n".join(rows) +
+            f"\n\nProvide comprehensive analysis using all indicators above. Return only the JSON.")
     return system, user
 
-# ── ENGINES ───────────────────────────────────────────────────────────────────
-def run_gpt4o(symbol, interval, klines, ticker):
-    system, user = build_prompt(symbol, interval, klines, ticker)
-    r = req.post("https://api.openai.com/v1/chat/completions",
+# ── GPT-4o WITH WEB SEARCH ───────────────────────────────────────────────────
+def run_gpt4o(symbol, interval, klines, ticker, indicators=None, fear_greed=None):
+    system, user = build_ai_prompt(symbol, interval, klines, ticker, indicators, fear_greed)
+    coin = symbol.replace("USDT","")
+    # Try with web search first for real-time news context
+    try:
+        r = requests.post("https://api.openai.com/v1/responses",
+            headers={"Authorization":f"Bearer {OPENAI_KEY}","Content-Type":"application/json"},
+            json={"model":"gpt-4o",
+                  "tools":[{"type":"web_search_preview"}],
+                  "input": f"{system}\n\n{user}\n\nAlso search for latest {coin} crypto news and sentiment before answering.",
+                  "temperature":0.25},
+            timeout=45)
+        if r.ok:
+            content = r.json().get("output","")
+            # Extract text from response
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "message":
+                        for c in item.get("content",[]):
+                            if c.get("type") == "output_text":
+                                raw = c["text"].strip()
+                                raw = raw.replace("```json","").replace("```","").strip()
+                                start = raw.find("{"); end = raw.rfind("}")+1
+                                if start >= 0 and end > start:
+                                    return json.loads(raw[start:end])
+    except:
+        pass
+    # Fallback: standard chat completions
+    r = requests.post("https://api.openai.com/v1/chat/completions",
         headers={"Authorization":f"Bearer {OPENAI_KEY}","Content-Type":"application/json"},
-        json={"model":"gpt-4o","messages":[{"role":"system","content":system},{"role":"user","content":user}],
-              "temperature":0.25,"max_tokens":1500,"response_format":{"type":"json_object"}},timeout=30)
+        json={"model":"gpt-4o",
+              "messages":[{"role":"system","content":system},{"role":"user","content":user}],
+              "temperature":0.25,"max_tokens":2000,
+              "response_format":{"type":"json_object"}},
+        timeout=30)
     r.raise_for_status()
     return json.loads(r.json()["choices"][0]["message"]["content"].strip())
 
-def run_grok(symbol, interval, klines, ticker):
-    system, user = build_prompt(symbol, interval, klines, ticker)
-    r = req.post("https://api.x.ai/v1/chat/completions",
-        headers={"Authorization":f"Bearer {GROK_KEY}","Content-Type":"application/json"},
-        json={"model":"grok-3","messages":[{"role":"system","content":system},{"role":"user","content":user}],
-              "temperature":0.25,"max_tokens":1500},timeout=30)
-    r.raise_for_status()
-    raw = r.json()["choices"][0]["message"]["content"].strip()
+# ── GROK-3 WITH LIVE X SEARCH ────────────────────────────────────────────────
+def run_grok2(symbol, interval, klines, ticker, indicators=None, fear_greed=None):
+    system, user = build_ai_prompt(symbol, interval, klines, ticker, indicators, fear_greed)
+    coin = symbol.replace("USDT","")
+    enriched_user = (user + f"\n\nIMPORTANT: Before finalizing your analysis, search X/Twitter for the latest "
+                    f"posts and sentiment about ${coin} crypto in the last 24 hours. "
+                    f"Factor real-time social sentiment into your bullish_probability score.")
+    try:
+        r = requests.post("https://api.x.ai/v1/chat/completions",
+            headers={"Authorization":f"Bearer {GROK_KEY}","Content-Type":"application/json"},
+            json={"model":"grok-3",
+                  "messages":[{"role":"system","content":system},{"role":"user","content":enriched_user}],
+                  "temperature":0.25,"max_tokens":2000,
+                  "search_parameters":{"mode":"on","sources":[{"type":"x"}],"return_citations":False}},
+            timeout=45)
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+        raw = raw.replace("```json","").replace("```","").strip()
+        start = raw.find("{"); end = raw.rfind("}")+1
+        return json.loads(raw[start:end] if start>=0 and end>start else raw)
+    except:
+        # Fallback without search
+        r = requests.post("https://api.x.ai/v1/chat/completions",
+            headers={"Authorization":f"Bearer {GROK_KEY}","Content-Type":"application/json"},
+            json={"model":"grok-3",
+                  "messages":[{"role":"system","content":system},{"role":"user","content":user}],
+                  "temperature":0.25,"max_tokens":2000},
+            timeout=30)
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+        raw = raw.replace("```json","").replace("```","").strip()
+        start = raw.find("{"); end = raw.rfind("}")+1
+        return json.loads(raw[start:end] if start>=0 and end>start else raw)
+
+# ── GEMINI 2.5 FLASH ─────────────────────────────────────────────────────────
+def run_gemini(symbol, interval, klines, ticker, indicators=None, fear_greed=None):
+    system, user = build_ai_prompt(symbol, interval, klines, ticker, indicators, fear_greed)
+    r = requests.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        headers={"Content-Type":"application/json","x-goog-api-key": GEMINI_KEY},
+        json={"system_instruction":{"parts":[{"text":system}]},
+              "contents":[{"role":"user","parts":[{"text":user}]}],
+              "generationConfig":{"temperature":0.25,"maxOutputTokens":8192}},
+        timeout=60)
+    if not r.ok:
+        raise Exception(f"Gemini {r.status_code}: {r.text[:500]}")
+    raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     raw = raw.replace("```json","").replace("```","").strip()
     start = raw.find("{"); end = raw.rfind("}")+1
-    return json.loads(raw[start:end] if start>=0 and end>start else raw)
+    if start >= 0 and end > start: raw = raw[start:end]
+    return json.loads(raw)
 
-def run_gemini(symbol, interval, klines, ticker):
-    system, user = build_prompt(symbol, interval, klines, ticker)
-    prompt = system + "\n\n" + user
-
-    # Try Vertex AI endpoint (works with AQ. OAuth tokens)
-    project_id = os.environ.get("GOOGLE_PROJECT_ID", "sunenergy-dashboard")
-    location   = "us-central1"
-    for model in ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-1.5-pro"]:
-        try:
-            url = (f"https://{location}-aiplatform.googleapis.com/v1/projects/"
-                   f"{project_id}/locations/{location}/publishers/google/models/"
-                   f"{model}:generateContent")
-            r = req.post(url,
-                headers={"Authorization": f"Bearer {GEMINI_KEY}",
-                         "Content-Type": "application/json"},
-                json={"contents":[{"role":"user","parts":[{"text":prompt}]}],
-                      "generationConfig":{"temperature":0.25,"maxOutputTokens":8192}},
-                timeout=60)
-            if not r.ok:
-                continue
-            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            raw = raw.replace("```json","").replace("```","").strip()
-            start = raw.find("{"); end = raw.rfind("}")+1
-            return json.loads(raw[start:end] if start>=0 and end>start else raw)
-        except Exception:
-            continue
-
-    # Fallback: try standard AI Studio endpoint
-    for model in ["gemini-2.5-flash", "gemini-2.0-flash"]:
-        try:
-            r = req.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_KEY},
-                json={"system_instruction":{"parts":[{"text":system}]},
-                      "contents":[{"role":"user","parts":[{"text":user}]}],
-                      "generationConfig":{"temperature":0.25,"maxOutputTokens":8192}},
-                timeout=60)
-            if not r.ok:
-                continue
-            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            raw = raw.replace("```json","").replace("```","").strip()
-            start = raw.find("{"); end = raw.rfind("}")+1
-            return json.loads(raw[start:end] if start>=0 and end>start else raw)
-        except Exception:
-            continue
-
-    raise Exception(f"Gemini failed. Key: {GEMINI_KEY[:8] if GEMINI_KEY else 'NOT SET'}")
-
-def run_mistral(symbol, interval, klines, ticker):
-    system, user = build_prompt(symbol, interval, klines, ticker)
-    r = req.post("https://api.mistral.ai/v1/chat/completions",
+# ── MISTRAL LARGE ─────────────────────────────────────────────────────────────
+def run_mistral(symbol, interval, klines, ticker, indicators=None, fear_greed=None):
+    system, user = build_ai_prompt(symbol, interval, klines, ticker, indicators, fear_greed)
+    r = requests.post("https://api.mistral.ai/v1/chat/completions",
         headers={"Authorization":f"Bearer {MISTRAL_KEY}","Content-Type":"application/json"},
         json={"model":"mistral-large-latest",
               "messages":[{"role":"system","content":system},{"role":"user","content":user}],
-              "temperature":0.25,"max_tokens":1500,
+              "temperature":0.25,"max_tokens":2000,
               "response_format":{"type":"json_object"}},
         timeout=30)
     r.raise_for_status()
@@ -140,218 +339,511 @@ def run_mistral(symbol, interval, klines, ticker):
     start = raw.find("{"); end = raw.rfind("}")+1
     return json.loads(raw[start:end] if start>=0 and end>start else raw)
 
-def run_claude(symbol, interval, klines, ticker):
-    system, user = build_prompt(symbol, interval, klines, ticker)
-    r = req.post("https://api.anthropic.com/v1/messages",
+# ── DEEPSEEK R1 ───────────────────────────────────────────────────────────────
+def run_deepseek(symbol, interval, klines, ticker, indicators=None, fear_greed=None):
+    system, user = build_ai_prompt(symbol, interval, klines, ticker, indicators, fear_greed)
+    r = requests.post("https://api.deepseek.com/chat/completions",
+        headers={"Authorization":f"Bearer {DEEPSEEK_KEY}","Content-Type":"application/json"},
+        json={"model":"deepseek-reasoner",
+              "messages":[{"role":"system","content":system},{"role":"user","content":user}],
+              "max_tokens":4000},
+        timeout=90)
+    r.raise_for_status()
+    msg = r.json()["choices"][0]["message"]
+    # R1 may return reasoning_content instead of content
+    raw = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+    raw = raw.replace("```json","").replace("```","").strip()
+    start = raw.find("{"); end = raw.rfind("}")+1
+    if start >= 0 and end > start:
+        return json.loads(raw[start:end])
+    else:
+        raise ValueError("DeepSeek returned no valid JSON")
+
+# ── CLAUDE HAIKU 4.5 ──────────────────────────────────────────────────────────
+def run_claude(symbol, interval, klines, ticker, indicators=None, fear_greed=None):
+    system, user = build_ai_prompt(symbol, interval, klines, ticker, indicators, fear_greed)
+    r = requests.post("https://api.anthropic.com/v1/messages",
         headers={"x-api-key":CLAUDE_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-        json={"model":"claude-haiku-4-5","max_tokens":1500,"system":system,
-              "messages":[{"role":"user","content":user}]},timeout=30)
+        json={"model":"claude-haiku-4-5","max_tokens":2000,"system":system,
+              "messages":[{"role":"user","content":user}]},
+        timeout=30)
     r.raise_for_status()
     raw = r.json()["content"][0]["text"].strip()
     raw = raw.replace("```json","").replace("```","").strip()
-    return json.loads(raw)
+    start = raw.find("{"); end = raw.rfind("}")+1
+    return json.loads(raw[start:end] if start>=0 and end>start else raw)
 
-ENGINES = [
-    ("GPT-4o",   run_gpt4o,   lambda: bool(OPENAI_KEY)),
-    ("Grok-3",   run_grok,    lambda: bool(GROK_KEY)),
-    ("Gemini",   run_gemini,  lambda: bool(GEMINI_KEY)),
-    ("Mistral",  run_mistral, lambda: bool(MISTRAL_KEY)),
-    ("Claude",   run_claude,  lambda: bool(CLAUDE_KEY)),
-]
+# ── KRONOS-BASE REAL MODEL ────────────────────────────────────────────────────
+def run_kronos_model(symbol, interval, klines, ticker):
+    import numpy as np, pandas as pd
+    if not KRONOS_PREDICTOR:
+        raise Exception("Kronos model not loaded")
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+    df = pd.DataFrame([{"open":k["o"],"high":k["h"],"low":k["l"],"close":k["c"],"volume":k["v"]} for k in klines])
+    ms     = MS_MAP[interval]
+    last_t = klines[-1]["t"]
+    x_times = pd.Series([datetime.fromtimestamp(k["t"]/1000, tz=timezone.utc) for k in klines])
+    y_times = pd.Series([datetime.fromtimestamp((last_t+ms*(i+1))/1000, tz=timezone.utc) for i in range(8)])
+
+    result = KRONOS_PREDICTOR.predict(df=df, x_timestamp=x_times, y_timestamp=y_times, pred_len=8)
+    fc = []
+    for i in range(len(result)):
+        row  = result.iloc[i]
+        mean = float(row.get("close", row.iloc[0]))
+        high = float(row.get("high",  mean*1.005))
+        low  = float(row.get("low",   mean*0.995))
+        fc.append({"mean":round(mean,4),"high":round(high,4),"low":round(low,4)})
+
+    # technical indicators
+    closes = [k["c"] for k in klines]
+    gains,losses = [],[]
+    for i in range(1,min(15,len(closes))):
+        d=closes[i]-closes[i-1]; gains.append(max(d,0)); losses.append(max(-d,0))
+    ag=sum(gains)/len(gains) if gains else 0
+    al=sum(losses)/len(losses) if losses else 0.001
+    rsi = round(100-(100/(1+ag/al)),1)
+    trend = "bullish" if closes[-1]>closes[-5] else "bearish" if closes[-1]<closes[-5] else "neutral"
+    returns = [(closes[i]-closes[i-1])/closes[i-1] for i in range(1,min(11,len(closes)))]
+    vol_pct = round(float(np.std(returns))*100,2) if returns else 0
+    recent  = closes[-20:]
+    bull = max(10,min(90, 50+(15 if trend=="bullish" else -15 if trend=="bearish" else 0)+(20 if rsi<30 else -20 if rsi>70 else 0)))
+    tgt  = fc[-1]["mean"] if fc else closes[-1]
+    sl   = round(min(recent)*0.998,4)
+
+    return {
+        "bullish_probability":    bull,
+        "volatility_probability": min(90,int(vol_pct*20)),
+        "trend":      trend,
+        "sentiment":  "buy" if bull>60 else "sell" if bull<40 else "neutral",
+        "key_levels": {"support_1":round(min(recent)*0.998,4),"support_2":round(min(recent)*0.995,4),
+                       "resistance_1":round(max(recent)*1.002,4),"resistance_2":round(max(recent)*1.005,4)},
+        "forecast_candles": fc,
+        "rsi_estimate":  rsi,
+        "macd_signal":   trend,
+        "risk_level":    "high" if vol_pct>2 else "medium" if vol_pct>0.8 else "low",
+        "target_price":  tgt,
+        "stop_loss":     sl,
+        "analysis": f"Kronos-base model (102M parameters, trained on 12B+ candlesticks from 45 global exchanges) projects price toward {tgt:.4f} over {IV_LABEL[interval]}. RSI is {rsi} indicating {'overbought' if rsi>70 else 'oversold' if rsi<30 else 'neutral'} conditions. Volatility is {vol_pct}% classified as {'high' if vol_pct>2 else 'medium' if vol_pct>0.8 else 'low'} risk. Key support at {sl:.4f}.",
+        "short_summary": f"Kronos-base forecasts {trend} move toward {tgt:.4f} — {IV_LABEL[interval]}."
+    }
+
+# ── HTML PAGE ─────────────────────────────────────────────────────────────────
 HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Kronos AI">
-<title>Kronos AI</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kronos — Crypto AI Forecast</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
-*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e2e8f0;min-height:100vh;min-height:-webkit-fill-available}
-.topbar{background:#161b27;border-bottom:1px solid #21293d;padding:12px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
-.logo{font-size:17px;font-weight:700;color:#f1f5f9;white-space:nowrap}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e2e8f0;min-height:100vh}
+.topbar{background:#161b27;border-bottom:1px solid #21293d;padding:14px 24px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.logo{font-size:18px;font-weight:700;color:#f1f5f9;letter-spacing:-0.3px}
 .logo span{color:#378ADD}
-select{background:#0d1117;color:#e2e8f0;border:1px solid #2d3748;border-radius:8px;padding:8px 10px;font-size:13px;cursor:pointer;outline:none;-webkit-appearance:none;flex:1;min-width:0}
-.run-btn{background:#378ADD;color:#fff;border:none;border-radius:8px;padding:9px 16px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;-webkit-appearance:none}
-.run-btn:disabled{background:#2d3748;color:#64748b}
-.main{padding:14px 16px;max-width:700px;margin:0 auto}
-.metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
-.met{background:#161b27;border-radius:10px;padding:11px 13px;border:1px solid #21293d}
-.ml{font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px}
-.mv{font-size:17px;font-weight:700;color:#f1f5f9}
-.ms{font-size:11px;margin-top:2px;color:#64748b}
+select{background:#0d1117;color:#e2e8f0;border:1px solid #2d3748;border-radius:8px;padding:7px 12px;font-size:13px;cursor:pointer;outline:none}
+select:hover{border-color:#4a5568}
+.run-btn{background:#378ADD;color:#fff;border:none;border-radius:8px;padding:8px 22px;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s;white-space:nowrap}
+.run-btn:hover{background:#2563eb}
+.run-btn:disabled{background:#2d3748;color:#64748b;cursor:not-allowed}
+.main{padding:20px 24px;max-width:1100px;margin:0 auto}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.met{background:#161b27;border-radius:10px;padding:13px 15px;border:1px solid #21293d}
+.ml{font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:.6px;margin-bottom:3px}
+.mv{font-size:19px;font-weight:700;color:#f1f5f9}
+.ms{font-size:12px;margin-top:2px;color:#64748b}
 .up{color:#1D9E75}.dn{color:#E24B4A}
-.cbox{background:#161b27;border-radius:10px;padding:14px;border:1px solid #21293d;margin-bottom:12px}
-.engine-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
-.ecard{background:#0d1117;border-radius:10px;padding:12px;border:1px solid #21293d}
-.pbar{background:#1e2d40;border-radius:4px;height:6px;overflow:hidden;margin:5px 0 3px}
-.pf{height:100%;border-radius:4px;transition:width .8s ease}
-.consensus{border-radius:12px;padding:16px;margin-bottom:12px}
-.status{font-size:12px;color:#64748b;padding:6px 0;min-height:20px}
-.abox{background:#0d1117;border-radius:8px;padding:12px;font-size:13px;line-height:1.65;color:#cbd5e1;border-left:3px solid #378ADD;margin-top:10px}
-.empty{text-align:center;padding:50px 20px;color:#475569;font-size:14px}
-.spin{display:inline-block;width:14px;height:14px;border:2px solid #2d3748;border-top-color:#378ADD;border-radius:50%;animation:sp .7s linear infinite;vertical-align:middle;margin-right:6px}
+.cbox{background:#161b27;border-radius:10px;padding:16px;border:1px solid #21293d;margin-bottom:14px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
+.pbar{background:#1e2d40;border-radius:6px;height:8px;overflow:hidden;margin:6px 0 3px}
+.pf{height:100%;border-radius:6px;transition:width 1s ease}
+.pval{font-size:21px;font-weight:700}
+.lvg{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:9px}
+.lv{background:#0d1117;border-radius:8px;padding:8px 11px}
+.lvl{font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:.5px}
+.lvv{font-size:14px;font-weight:700;margin-top:2px}
+.abox{background:#0d1117;border-radius:10px;padding:14px;font-size:14px;line-height:1.75;color:#cbd5e1;border-left:3px solid #378ADD;margin-top:10px}
+.summary{background:#0f2d1a;border:1px solid #1D9E75;border-radius:10px;padding:12px 15px;font-size:14px;font-weight:500;color:#a7f3d0;margin-bottom:14px}
+.badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;margin-right:5px}
+.legend{display:flex;gap:12px;flex-wrap:wrap}
+.li{display:flex;align-items:center;gap:5px;font-size:11px;color:#64748b}
+.ld{width:16px;height:3px;border-radius:2px}
+.spin{display:none;width:16px;height:16px;border:2px solid #2d3748;border-top-color:#378ADD;border-radius:50%;animation:sp .7s linear infinite;margin-left:8px}
 @keyframes sp{to{transform:rotate(360deg)}}
-.badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 8px;border-radius:12px}
-@media(min-width:600px){.metrics{grid-template-columns:repeat(4,1fr)}.engine-grid{grid-template-columns:repeat(4,1fr)}}
+.status{font-size:12px;color:#64748b;margin-left:8px}
+.empty{text-align:center;padding:60px 20px;color:#475569;font-size:14px}
+.tc{background:#161b27;border-radius:10px;padding:12px 15px;border:1px solid #21293d}
+@media(max-width:600px){.metrics{grid-template-columns:1fr 1fr}.g2{grid-template-columns:1fr}.g3{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
+
 <div class="topbar">
   <div class="logo">Kronos <span>AI</span></div>
   <select id="sym">
-    <option value="BTCUSDT">BTC/USDT</option>
-    <option value="ETHUSDT">ETH/USDT</option>
-    <option value="SOLUSDT">SOL/USDT</option>
-    <option value="BNBUSDT">BNB/USDT</option>
-    <option value="XRPUSDT">XRP/USDT</option>
-    <option value="ADAUSDT">ADA/USDT</option>
-    <option value="TAOUSDT">TAO/USDT</option>
-    <option value="ZECUSDT">ZEC/USDT</option>
-    <option value="DOGEUSDT">DOGE/USDT</option>
-    <option value="AVAXUSDT">AVAX/USDT</option>
-    <option value="DOTUSDT">DOT/USDT</option>
-    <option value="LINKUSDT">LINK/USDT</option>
-    <option value="UNIUSDT">UNI/USDT</option>
+    <option value="BTCUSDT">BTC / USDT — Bitcoin</option>
+    <option value="ETHUSDT">ETH / USDT — Ethereum</option>
+    <option value="SOLUSDT">SOL / USDT — Solana</option>
+    <option value="BNBUSDT">BNB / USDT — BNB</option>
+    <option value="XRPUSDT">XRP / USDT — XRP</option>
+    <option value="ADAUSDT">ADA / USDT — Cardano</option>
+    <option value="TAOUSDT">TAO / USDT — Bittensor</option>
+    <option value="ZECUSDT">ZEC / USDT — Zcash</option>
+    <option value="DOGEUSDT">DOGE / USDT — Dogecoin</option>
+    <option value="AVAXUSDT">AVAX / USDT — Avalanche</option>
+    <option value="DOTUSDT">DOT / USDT — Polkadot</option>
+    <option value="LINKUSDT">LINK / USDT — Chainlink</option>
+    <option value="UNIUSDT">UNI / USDT — Uniswap</option>
+    <option value="CPOOLUSDT">CPOOL / USDT — Clearpool ★KuCoin</option>
+    <option value="NPCUSDT">NPC / USDT — Non Playable Coin ★KuCoin</option>
+    <option value="TELUSDT">TEL / USDT — Telcoin ★KuCoin</option>
   </select>
   <select id="iv">
-    <option value="15m">15m</option>
-    <option value="1h" selected>1h</option>
-    <option value="4h">4h</option>
-    <option value="1d">1d</option>
+    <option value="5m">5 minutes — scalping</option>
+    <option value="15m" selected>15 minutes — day trading</option>
+    <option value="30m">30 minutes — day trading</option>
+    <option value="1h">1 hour</option>
+    <option value="4h">4 hours</option>
+    <option value="1d">1 day</option>
   </select>
-  <button class="run-btn" id="runBtn" onclick="runForecast()">Run</button>
+  <button class="run-btn" id="runBtn" onclick="runForecast()">Run AI Forecast</button>
+  <select id="engine" title="AI Engine">
+    <option value="gpt4o">GPT-4o (OpenAI)</option>
+    <option value="grok2">Grok-3 (xAI)</option>
+    <option value="gemini">Gemini 2.5 Flash (Google)</option>
+    <option value="mistral">Mistral Large</option>
+    <option value="deepseek">DeepSeek R1</option>
+    <option value="claude">Claude Haiku 4.5 (Anthropic)</option>
+    <option value="kronos">Kronos-base 102M (real model)</option>
+    <option value="combined">⚡ Combined — All engines</option>
+  </select>
+  <div class="spin" id="spin"></div>
+  <span class="status" id="status"></span>
 </div>
 
 <div class="main">
-  <div class="status" id="status"></div>
-  <div id="content"><div class="empty">Select a symbol and tap Run</div></div>
+  <div id="content">
+    <div class="empty">Select a symbol and interval above, then click <b>Run AI Forecast</b></div>
+  </div>
 </div>
 
 <script>
 let chart = null;
-function fp(v){
-  if(v>=10000) return '$'+v.toLocaleString('en-US',{maximumFractionDigits:0});
-  if(v>=1) return '$'+v.toFixed(2);
-  return '$'+v.toFixed(5);
-}
 
-async function runForecast(){
-  const sym=document.getElementById('sym').value;
-  const iv=document.getElementById('iv').value;
-  const btn=document.getElementById('runBtn');
-  const status=document.getElementById('status');
-  btn.disabled=true;
-  status.innerHTML='<span class="spin"></span>Running all engines...';
-  try{
-    const res=await fetch(`/forecast?symbol=${sym}&interval=${iv}`);
-    const data=await res.json();
-    if(data.error){status.textContent='Error: '+data.error;btn.disabled=false;return;}
+async function runForecast() {
+  const sym    = document.getElementById('sym').value;
+  const iv     = document.getElementById('iv').value;
+  const engine = document.getElementById('engine').value;
+  const btn    = document.getElementById('runBtn');
+  const spin   = document.getElementById('spin');
+  const status = document.getElementById('status');
+
+  btn.disabled = true;
+  spin.style.display = 'block';
+
+  if (engine === 'combined') {
+    status.textContent = 'Running all 5 engines — please wait (~30 seconds)...';
+    try {
+      const res = await fetch(`/forecast_combined?symbol=${sym}&interval=${iv}`);
+      const data = await res.json();
+      if (data.error) {
+        status.textContent = 'Error: ' + data.error;
+        btn.disabled = false; spin.style.display = 'none'; return;
+      }
+      renderCombined(data);
+      status.textContent = `Combined consensus — ${new Date().toLocaleTimeString()}`;
+    } catch(e) {
+      status.textContent = 'Error: ' + e.message;
+    }
+    btn.disabled = false; spin.style.display = 'none'; return;
+  }
+
+  status.textContent = 'Fetching market data...';
+
+  try {
+    status.textContent = 'Running AI analysis...';
+    const res = await fetch(`/forecast?symbol=${sym}&interval=${iv}&engine=${engine}`);
+    const data = await res.json();
+
+    if (data.error) {
+      status.textContent = 'Error: ' + data.error;
+      btn.disabled = false;
+      spin.style.display = 'none';
+      return;
+    }
+
     renderDashboard(data);
-    status.textContent='Updated '+new Date().toLocaleTimeString();
-  }catch(e){status.textContent='Error: '+e.message;}
-  btn.disabled=false;
+    status.textContent = `Updated ${new Date().toLocaleTimeString()} · ${data.engine}`;
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+
+  btn.disabled = false;
+  spin.style.display = 'none';
 }
 
-function renderDashboard(d){
-  const cons=d.consensus;
-  const price=d.price,chg=d.chg;
-  const cc=chg>=0?'#1D9E75':'#E24B4A';
-  const votes=cons.bullish_votes,total=cons.total;
-  const cvote=votes>=Math.ceil(total/2)?'#1D9E75':votes===0?'#E24B4A':'#BA7517';
-  const clabel=`${votes}/${total} ${votes>=Math.ceil(total/2)?'BULLISH':votes===0?'BEARISH':'BULLISH'}`;
-  const csignal=votes>=Math.ceil(total/2)?'BUY':votes===0?'SELL':'NEUTRAL';
-  const csbg=votes>=Math.ceil(total/2)?'rgba(29,158,117,0.15)':votes===0?'rgba(226,75,74,0.15)':'rgba(186,117,23,0.15)';
-  const cborder=votes>=Math.ceil(total/2)?'#1D9E75':votes===0?'#E24B4A':'#BA7517';
+function fp(v) {
+  if (v >= 10000) return '$' + v.toLocaleString('en-US', {maximumFractionDigits:0});
+  if (v >= 1)     return '$' + v.toFixed(2);
+  return '$' + v.toFixed(5);
+}
+function fvol(v) {
+  if (v >= 1e9) return (v/1e9).toFixed(1)+'B';
+  if (v >= 1e6) return (v/1e6).toFixed(0)+'M';
+  return (v/1e3).toFixed(0)+'K';
+}
 
-  const closes=d.klines.map(k=>k.c);
-  const times=d.klines.map(k=>k.tl);
-  const fc=d.forecast_candles||[];
-  const allT=[...times,...d.fc_times];
-  const hist=[...closes,...Array(fc.length).fill(null)];
-  const pad=Array(closes.length-1).fill(null);
-  const fcmD=[...pad,closes[closes.length-1],...fc.map(c=>c.mean)];
-  const fchD=[...pad,closes[closes.length-1],...fc.map(c=>c.high)];
-  const fclD=[...pad,closes[closes.length-1],...fc.map(c=>c.low)];
+function renderDashboard(d) {
+  const a = d.analysis;
+  const price = d.price, chg = d.chg;
+  const bull = a.bullish_probability || 50;
+  const volp = a.volatility_probability || 50;
+  const trend = (a.trend || 'neutral').toUpperCase();
+  const sent  = (a.sentiment || 'neutral').toUpperCase();
+  const risk  = (a.risk_level || 'medium').toUpperCase();
+  const rsi   = a.rsi_estimate || 50;
+  const tgt   = a.target_price || price;
+  const sl    = a.stop_loss    || price;
+  const kl    = a.key_levels   || {};
+  const s1 = kl.support_1    || price*0.97;
+  const s2 = kl.support_2    || price*0.94;
+  const r1 = kl.resistance_1 || price*1.03;
+  const r2 = kl.resistance_2 || price*1.06;
+  const rr = Math.abs(sl-price)>0 ? '1 : '+(Math.abs((tgt-price)/(sl-price))).toFixed(1) : '—';
+  const tgt_p = ((tgt-price)/price*100).toFixed(2);
+  const sl_p  = ((sl-price)/price*100).toFixed(2);
 
-  const ecards=d.engines.map(e=>{
-    const ec=e.bullish_probability>=50?'#1D9E75':'#E24B4A';
-    const et=(e.trend||'neutral').toUpperCase();
-    const etc=et==='BULLISH'?'#1D9E75':et==='BEARISH'?'#E24B4A':'#888';
-    return `<div class="ecard">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-        <span style="font-size:12px;font-weight:600;color:#94a3b8">${e.name}</span>
-        <span class="badge" style="background:${ec}22;color:${etc}">${et}</span>
-      </div>
-      <div class="pbar"><div class="pf" style="width:${e.bullish_probability}%;background:${ec}"></div></div>
-      <div style="font-size:16px;font-weight:700;color:${ec}">${e.bullish_probability}%</div>
-      <div style="font-size:11px;color:#475569;margin-top:5px">Target: <span style="color:#f1f5f9">${fp(e.target_price)}</span></div>
-      <div style="font-size:11px;color:#475569">Stop: <span style="color:#E24B4A">${fp(e.stop_loss)}</span></div>
-    </div>`;
-  }).join('');
+  const cc = chg>=0?'#1D9E75':'#E24B4A';
+  const tc = trend=='BULLISH'?'#1D9E75':trend=='BEARISH'?'#E24B4A':'#888';
+  const sc = sent.includes('BUY')?'#1D9E75':sent.includes('SELL')?'#E24B4A':'#888';
+  const rc = {LOW:'#1D9E75',MEDIUM:'#BA7517',HIGH:'#E24B4A',EXTREME:'#A32D2D'}[risk]||'#888';
+  const bc = bull>=50?'#1D9E75':'#E24B4A';
+  const rsic = rsi>70?'#E24B4A':rsi<30?'#1D9E75':'#f1f5f9';
+  const tbg = trend=='BULLISH'?'#0a2e18':trend=='BEARISH'?'#2e0a0a':'#1a1a1a';
+  const sbg = sent.includes('BUY')?'#0a2e18':sent.includes('SELL')?'#2e0a0a':'#1a1a1a';
 
-  document.getElementById('content').innerHTML=`
-<div class="consensus" style="background:${csbg};border:1px solid ${cborder}">
-  <div style="font-size:11px;color:${cborder};text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Consensus — ${d.symbol} ${d.interval.toUpperCase()}</div>
-  <div style="display:flex;align-items:center;justify-content:space-between">
-    <div>
-      <div style="font-size:26px;font-weight:700;color:${cvote}">${clabel}</div>
-      <div style="font-size:12px;color:#94a3b8;margin-top:2px">${cons.agreement} · avg ${cons.avg_bullish}% bullish</div>
-    </div>
-    <div style="text-align:center">
-      <div style="font-size:11px;color:#475569">Signal</div>
-      <div style="font-size:20px;font-weight:700;color:${cvote}">${csignal}</div>
-      <div style="font-size:10px;color:#475569">${cons.risk.toUpperCase()}</div>
-    </div>
-  </div>
-</div>
+  // build chart data
+  const closes = d.klines.map(k=>k.c);
+  const times  = d.klines.map(k=>k.tl);
+  const fc     = a.forecast_candles || [];
+  const fcm    = fc.map(c=>c.mean);
+  const fch    = fc.map(c=>c.high);
+  const fcl2   = fc.map(c=>c.low);
+  const fct    = d.fc_times;
+  const allT   = [...times,...fct];
+  const hist   = [...closes,...Array(fc.length).fill(null)];
+  const pad    = Array(closes.length-1).fill(null);
+  const fcmD   = [...pad,closes[closes.length-1],...fcm];
+  const fchD   = [...pad,closes[closes.length-1],...fch];
+  const fclD   = [...pad,closes[closes.length-1],...fcl2];
 
-<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex-wrap:wrap">
-  <span style="font-size:16px;font-weight:700;color:#f1f5f9">${d.symbol} · ${d.interval.toUpperCase()}</span>
-  <span style="font-size:22px;font-weight:700;color:#f1f5f9">${fp(price)}</span>
-  <span style="font-size:13px;color:${cc}">${chg>=0?'+':''}${chg.toFixed(2)}% 24h</span>
+  document.getElementById('content').innerHTML = `
+<div class="summary">${a.short_summary||''}</div>
+
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+  <span style="font-size:15px;font-weight:700;color:#f1f5f9">${d.symbol} &nbsp;·&nbsp; ${d.interval.toUpperCase()}</span>
+  <span class="badge" style="background:${tbg};color:${tc}">${trend}</span>
+  <span class="badge" style="background:${sbg};color:${sc}">${sent}</span>
+  <span class="badge" style="background:#1a1a1a;color:${rc}">RISK: ${risk}</span>
 </div>
 
 <div class="metrics">
-  <div class="met"><div class="ml">Volume 24h</div><div class="mv" style="font-size:15px">${d.vol}</div></div>
-  <div class="met"><div class="ml">24h High</div><div class="mv" style="font-size:15px">${fp(d.high24)}</div></div>
-  <div class="met"><div class="ml">24h Low</div><div class="mv" style="font-size:15px">${fp(d.low24)}</div></div>
-  <div class="met"><div class="ml">Avg Target</div><div class="mv" style="font-size:15px;color:#1D9E75">${fp(cons.avg_target)}</div></div>
+  <div class="met"><div class="ml">Price</div><div class="mv">${fp(price)}</div><div class="ms" style="color:${cc}">${chg>=0?'+':''}${chg.toFixed(2)}% 24h</div></div>
+  <div class="met"><div class="ml">Volume 24h</div><div class="mv">${fvol(d.vol)}</div><div class="ms">USDT</div></div>
+  <div class="met"><div class="ml">24h H / L</div><div class="mv" style="font-size:16px">${fp(d.high24)}</div><div class="ms">${fp(d.low24)}</div></div>
+  <div class="met"><div class="ml">RSI / MACD</div><div class="mv" style="color:${rsic}">${rsi}</div><div class="ms">${a.macd_signal||'—'}</div></div>
 </div>
 
-<div class="engine-grid">${ecards}</div>
-
 <div class="cbox">
-  <div style="font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Price chart + forecast</div>
-  <div style="position:relative;width:100%;height:220px">
-    <canvas id="mc" role="img" aria-label="chart"></canvas>
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+    <span style="font-size:13px;color:#94a3b8;font-weight:600">${d.symbol} ${d.interval.toUpperCase()} — ${d.iv_label}</span>
+    <div class="legend">
+      <span class="li"><span class="ld" style="background:#378ADD"></span>Historical</span>
+      <span class="li"><span class="ld" style="background:#1D9E75"></span>AI forecast</span>
+      <span class="li"><span class="ld" style="background:rgba(29,158,117,0.4)"></span>Range</span>
+    </div>
+  </div>
+  <div style="position:relative;width:100%;height:300px">
+    <canvas id="mc" role="img" aria-label="price chart"></canvas>
   </div>
 </div>
 
-<div class="cbox">
-  <div style="font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:.5px">Combined analysis</div>
-  <div class="abox">${cons.combined_analysis}</div>
+<div class="g2">
+  <div class="cbox" style="margin-bottom:0">
+    <div class="ml">Bullish probability</div>
+    <div class="pbar"><div class="pf" id="bb" style="width:0%;background:${bc}"></div></div>
+    <div class="pval" style="color:${bc}">${bull}%</div>
+    <div style="margin-top:12px">
+      <div class="ml">Elevated volatility</div>
+      <div class="pbar"><div class="pf" id="vb" style="width:0%;background:#BA7517"></div></div>
+      <div class="pval" style="color:#BA7517">${volp}%</div>
+    </div>
+  </div>
+  <div class="cbox" style="margin-bottom:0">
+    <div class="ml">Key price levels</div>
+    <div class="lvg">
+      <div class="lv" style="border-left:3px solid #E24B4A"><div class="lvl">Resistance 2</div><div class="lvv" style="color:#E24B4A">${fp(r2)}</div></div>
+      <div class="lv" style="border-left:3px solid #f97316"><div class="lvl">Resistance 1</div><div class="lvv" style="color:#f97316">${fp(r1)}</div></div>
+      <div class="lv" style="border-left:3px solid #1D9E75"><div class="lvl">Support 1</div><div class="lvv" style="color:#1D9E75">${fp(s1)}</div></div>
+      <div class="lv" style="border-left:3px solid #0F6E56"><div class="lvl">Support 2</div><div class="lvv" style="color:#0F6E56">${fp(s2)}</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="g3" style="margin-top:12px">
+  <div class="tc"><div class="ml">Price target</div><div style="font-size:19px;font-weight:700;color:#1D9E75;margin-top:4px">${fp(tgt)}</div><div class="ms">${tgt_p>=0?'+':''}${tgt_p}% from now</div></div>
+  <div class="tc"><div class="ml">Stop loss</div><div style="font-size:19px;font-weight:700;color:#E24B4A;margin-top:4px">${fp(sl)}</div><div class="ms">${sl_p}% from now</div></div>
+  <div class="tc"><div class="ml">Risk / Reward</div><div style="font-size:19px;font-weight:700;color:#f1f5f9;margin-top:4px">${rr}</div><div class="ms">target vs stop</div></div>
+</div>
+
+<div class="cbox" style="margin-top:12px">
+  <span style="font-size:13px;color:#94a3b8;font-weight:600">AI analysis</span>
+  <div class="abox">${a.analysis||''}</div>
 </div>`;
 
-  if(chart){chart.destroy();chart=null;}
-  chart=new Chart(document.getElementById('mc').getContext('2d'),{
+  // animate bars
+  setTimeout(()=>{
+    document.getElementById('bb').style.width = bull+'%';
+    document.getElementById('vb').style.width = volp+'%';
+  },100);
+
+  // draw chart
+  if (chart) { chart.destroy(); chart = null; }
+  const ctx = document.getElementById('mc').getContext('2d');
+  chart = new Chart(ctx, {
+    type:'line',
+    data:{labels:allT,datasets:[
+      {label:'Historical',data:hist,borderColor:'#378ADD',backgroundColor:'rgba(55,138,221,0.07)',borderWidth:2,pointRadius:0,pointHoverRadius:3,fill:true,tension:0.3},
+      {label:'High',data:fchD,borderColor:'rgba(29,158,117,0.25)',backgroundColor:'rgba(29,158,117,0.12)',borderWidth:1,pointRadius:0,fill:'+1',tension:0.3},
+      {label:'Low',data:fclD,borderColor:'rgba(29,158,117,0.25)',borderWidth:1,pointRadius:0,fill:false,tension:0.3},
+      {label:'Forecast',data:fcmD,borderColor:'#1D9E75',borderWidth:2,borderDash:[6,3],pointRadius:0,pointHoverRadius:4,fill:false,tension:0.3}
+    ]},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      interaction:{mode:'index',intersect:false},
+      plugins:{legend:{display:false},tooltip:{backgroundColor:'#1e2330',borderColor:'#2d3748',borderWidth:1,titleColor:'#94a3b8',bodyColor:'#e2e8f0',
+        callbacks:{label:c=>c.parsed.y===null?null:` ${c.dataset.label}: ${fp(c.parsed.y)}`}}},
+      scales:{
+        x:{ticks:{maxTicksLimit:12,color:'#475569',font:{size:11},autoSkip:true,maxRotation:45},grid:{color:'rgba(255,255,255,0.04)'}},
+        y:{ticks:{color:'#475569',font:{size:11},callback:v=>v>=1000?'$'+v.toLocaleString('en-US',{maximumFractionDigits:0}):'$'+v.toFixed(4)},grid:{color:'rgba(255,255,255,0.04)'}}
+      }
+    }
+  });
+}
+function renderCombined(d) {
+  const engines = d.engines;
+  const cons    = d.consensus;
+  const price   = d.price;
+  const chg     = d.chg;
+  const cc      = chg>=0?'#1D9E75':'#E24B4A';
+
+  // consensus colors
+  const votes   = cons.bullish_votes;
+  const total   = cons.total;
+  const cvote   = votes >= Math.ceil(total/2) ? '#1D9E75' : votes === 0 ? '#E24B4A' : '#BA7517';
+  const clabel  = `${votes}/${total} ${votes >= Math.ceil(total/2) ? 'BULLISH' : votes === 0 ? 'BEARISH' : 'BULLISH'}`;
+  const csignal = votes >= Math.ceil(total/2) ? 'BUY' : votes === 0 ? 'SELL' : 'NEUTRAL';
+  const csbg    = votes >= 2 ? '#0a2e18' : votes === 0 ? '#2e0a0a' : '#1a1a1a';
+
+  // build chart data from Kronos (most specialized)
+  const kronosData = engines.find(e=>e.name==='Kronos') || engines[0];
+  const closes  = d.klines.map(k=>k.c);
+  const times   = d.klines.map(k=>k.tl);
+  const fc      = kronosData.forecast_candles || [];
+  const fcm     = fc.map(c=>c.mean);
+  const fch     = fc.map(c=>c.high);
+  const fcl     = fc.map(c=>c.low);
+  const fct     = d.fc_times;
+  const allT    = [...times,...fct];
+  const hist    = [...closes,...Array(fc.length).fill(null)];
+  const pad     = Array(closes.length-1).fill(null);
+  const fcmD    = [...pad,closes[closes.length-1],...fcm];
+  const fchD    = [...pad,closes[closes.length-1],...fch];
+  const fclD    = [...pad,closes[closes.length-1],...fcl];
+
+  function fp(v){
+    if(v>=10000) return '$'+v.toLocaleString('en-US',{maximumFractionDigits:0});
+    if(v>=1) return '$'+v.toFixed(2);
+    return '$'+v.toFixed(5);
+  }
+
+  // engine cards HTML
+  const engineCards = engines.map(e => {
+    const ec = e.bullish_probability>=50?'#1D9E75':'#E24B4A';
+    const et = (e.trend||'neutral').toUpperCase();
+    const etbg = et==='BULLISH'?'#0a2e18':et==='BEARISH'?'#2e0a0a':'#1a1a1a';
+    const etc = et==='BULLISH'?'#1D9E75':et==='BEARISH'?'#E24B4A':'#888';
+    return `<div style="background:#0d1117;border-radius:10px;padding:14px 16px;border:1px solid #21293d">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <span style="font-size:13px;font-weight:600;color:#94a3b8">${e.name}</span>
+        <span style="font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;background:${etbg};color:${etc}">${et}</span>
+      </div>
+      <div style="font-size:11px;color:#475569;margin-bottom:4px">Bullish probability</div>
+      <div style="background:#1e2d40;border-radius:4px;height:7px;overflow:hidden;margin-bottom:4px">
+        <div style="width:${e.bullish_probability}%;height:100%;background:${ec};border-radius:4px"></div>
+      </div>
+      <div style="font-size:18px;font-weight:700;color:${ec}">${e.bullish_probability}%</div>
+      <div style="font-size:11px;color:#475569;margin-top:8px">Target: <span style="color:#f1f5f9;font-weight:600">${fp(e.target_price)}</span></div>
+      <div style="font-size:11px;color:#475569">Stop: <span style="color:#E24B4A;font-weight:600">${fp(e.stop_loss)}</span></div>
+      <div style="font-size:12px;color:#64748b;margin-top:8px;line-height:1.5">${(e.short_summary||'').substring(0,120)}${(e.short_summary||'').length>120?'...':''}</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('content').innerHTML = `
+<div style="background:linear-gradient(135deg,#0a1628,#0f2d1a);border:1px solid ${cvote};border-radius:12px;padding:18px 20px;margin-bottom:16px">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+    <div>
+      <div style="font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px">Consensus signal — ${d.symbol} ${d.interval.toUpperCase()}</div>
+      <div style="font-size:28px;font-weight:700;color:${cvote}">${clabel}</div>
+      <div style="font-size:13px;color:#94a3b8;margin-top:4px">${cons.agreement} — avg bullish: ${cons.avg_bullish}% — avg target: ${fp(cons.avg_target)}</div>
+    </div>
+    <div style="text-align:center;background:rgba(0,0,0,0.3);border-radius:10px;padding:12px 20px">
+      <div style="font-size:11px;color:#475569;margin-bottom:4px">Final signal</div>
+      <div style="font-size:22px;font-weight:700;color:${cvote}">${csignal}</div>
+      <div style="font-size:11px;color:#475569;margin-top:4px">Risk: ${cons.risk.toUpperCase()}</div>
+    </div>
+  </div>
+</div>
+
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+  <span style="font-size:15px;font-weight:700;color:#f1f5f9">${d.symbol} · ${d.interval.toUpperCase()}</span>
+  <span style="font-size:20px;font-weight:700;color:#f1f5f9">${fp(price)}</span>
+  <span style="font-size:13px;color:${cc}">${chg>=0?'+':''}${chg.toFixed(2)}% 24h</span>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">${engineCards}</div>
+
+<div style="background:#161b27;border-radius:10px;padding:18px;border:1px solid #21293d;margin-bottom:14px">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+    <span style="font-size:13px;color:#94a3b8;font-weight:600">${d.symbol} ${d.interval.toUpperCase()} — Kronos-base price forecast</span>
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <span style="display:flex;align-items:center;gap:5px;font-size:11px;color:#64748b"><span style="width:16px;height:3px;background:#378ADD;border-radius:2px;display:inline-block"></span>Historical</span>
+      <span style="display:flex;align-items:center;gap:5px;font-size:11px;color:#64748b"><span style="width:16px;height:3px;background:#7F77DD;border-radius:2px;display:inline-block"></span>Kronos forecast</span>
+    </div>
+  </div>
+  <div style="position:relative;width:100%;height:280px"><canvas id="mc" role="img" aria-label="chart"></canvas></div>
+</div>
+
+<div style="background:#161b27;border-radius:10px;padding:14px 16px;border:1px solid #21293d">
+  <div style="font-size:13px;color:#94a3b8;font-weight:600;margin-bottom:10px">Combined analysis</div>
+  <div style="background:#0d1117;border-radius:8px;padding:14px;font-size:14px;line-height:1.75;color:#cbd5e1;border-left:3px solid ${cvote}">${cons.combined_analysis}</div>
+</div>`;
+
+  if (chart) { chart.destroy(); chart = null; }
+  const ctx = document.getElementById('mc').getContext('2d');
+  chart = new Chart(ctx,{
     type:'line',data:{labels:allT,datasets:[
-      {label:'Historical',data:hist,borderColor:'#378ADD',backgroundColor:'rgba(55,138,221,0.07)',borderWidth:2,pointRadius:0,fill:true,tension:0.3},
+      {label:'Historical',data:hist,borderColor:'#378ADD',backgroundColor:'rgba(55,138,221,0.07)',borderWidth:2,pointRadius:0,pointHoverRadius:3,fill:true,tension:0.3},
       {label:'High',data:fchD,borderColor:'rgba(127,119,221,0.2)',backgroundColor:'rgba(127,119,221,0.08)',borderWidth:1,pointRadius:0,fill:'+1',tension:0.3},
       {label:'Low',data:fclD,borderColor:'rgba(127,119,221,0.2)',borderWidth:1,pointRadius:0,fill:false,tension:0.3},
-      {label:'Forecast',data:fcmD,borderColor:'#7F77DD',borderWidth:2,borderDash:[5,3],pointRadius:0,fill:false,tension:0.3}
+      {label:'Kronos',data:fcmD,borderColor:'#7F77DD',borderWidth:2,borderDash:[6,3],pointRadius:0,pointHoverRadius:4,fill:false,tension:0.3}
     ]},
     options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
       plugins:{legend:{display:false},tooltip:{backgroundColor:'#1e2330',borderColor:'#2d3748',borderWidth:1,titleColor:'#94a3b8',bodyColor:'#e2e8f0',
         callbacks:{label:c=>c.parsed.y===null?null:` ${c.dataset.label}: ${fp(c.parsed.y)}`}}},
       scales:{
-        x:{ticks:{maxTicksLimit:6,color:'#475569',font:{size:10},autoSkip:true},grid:{color:'rgba(255,255,255,0.04)'}},
-        y:{ticks:{color:'#475569',font:{size:10},callback:v=>v>=1000?'$'+v.toLocaleString('en-US',{maximumFractionDigits:0}):'$'+v.toFixed(2)},grid:{color:'rgba(255,255,255,0.04)'}}
+        x:{ticks:{maxTicksLimit:12,color:'#475569',font:{size:11},autoSkip:true,maxRotation:45},grid:{color:'rgba(255,255,255,0.04)'}},
+        y:{ticks:{color:'#475569',font:{size:11},callback:v=>v>=1000?'$'+v.toLocaleString('en-US',{maximumFractionDigits:0}):'$'+v.toFixed(4)},grid:{color:'rgba(255,255,255,0.04)'}}
       }
     }
   });
@@ -360,115 +852,262 @@ function renderDashboard(d){
 </body>
 </html>"""
 
-# ── ROUTES ────────────────────────────────────────────────────────────────────
-@app.route("/status")
-def status():
-    return jsonify({
-        "OPENAI_API_KEY":    "OK" if OPENAI_KEY  else "MISSING",
-        "XAI_API_KEY":       "OK" if GROK_KEY    else "MISSING",
-        "GEMINI_API_KEY":    "OK" if GEMINI_KEY  else "MISSING",
-        "MISTRAL_API_KEY":   "OK" if MISTRAL_KEY else "MISSING",
-        "ANTHROPIC_API_KEY": "OK" if CLAUDE_KEY  else "MISSING",
-        "gemini_key_start":  GEMINI_KEY[:8]  if GEMINI_KEY  else "NOT SET",
-        "mistral_key_start": MISTRAL_KEY[:8] if MISTRAL_KEY else "NOT SET",
-    })
+# ── SERVER ────────────────────────────────────────────────────────────────────
+def time_label(ts_ms, interval):
+    dt = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc)
+    if interval == "1d":             return dt.strftime("%b %d")
+    if interval in ("5m","15m","30m"): return dt.strftime("%H:%M")
+    return dt.strftime("%m/%d %H:%M")
 
-@app.route("/")
-def index():
-    return render_template_string(HTML)
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args): pass  # suppress logs
 
-@app.route("/forecast")
-def forecast():
-    symbol   = request.args.get("symbol","BTCUSDT").upper()
-    interval = request.args.get("interval","1h")
+    def send_json(self, data, code=200):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length",len(body))
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.end_headers()
+        self.wfile.write(body)
 
-    try:
-        klines = fetch_klines(symbol, interval)
-        ticker = fetch_ticker(symbol)
-    except Exception as e:
-        return jsonify({"error":f"Binance: {e}"})
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
 
-    price  = float(ticker["lastPrice"])
-    vol    = float(ticker["quoteVolume"])
+        if parsed.path == "/":
+            body = HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type","text/html")
+            self.send_header("Content-Length",len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
-    def fvol(v):
-        if v>=1e9: return f"{v/1e9:.1f}B"
-        if v>=1e6: return f"{v/1e6:.0f}M"
-        return f"{v/1e3:.0f}K"
+        if parsed.path == "/forecast_combined":
+            params   = urllib.parse.parse_qs(parsed.query)
+            symbol   = params.get("symbol",  ["BTCUSDT"])[0].upper()
+            interval = params.get("interval",["15m"])[0]
 
-    results, errors = [], []
-    for name, fn, check in ENGINES:
-        if not check():
-            errors.append(f"{name}: API key not set")
-            continue
-        try:
-            r = fn(symbol, interval, klines, ticker)
-            r["name"] = name
-            results.append(r)
-        except Exception as e:
-            errors.append(f"{name}: {e}")
+            try:
+                klines = fetch_klines(symbol, interval)
+                ticker = fetch_ticker(symbol)
+            except Exception as e:
+                self.send_json({"error":f"Data fetch failed: {e}"})
+                return
 
-    if not results:
-        return jsonify({"error":"All engines failed: " + " | ".join(errors)})
+            # Pre-calculate indicators and fetch Fear & Greed once for all engines
+            indicators = calc_indicators(klines)
+            fear_greed = fetch_fear_greed()
 
-    bulls   = [r["bullish_probability"] for r in results]
-    trends  = [r.get("trend","neutral") for r in results]
-    targets = [r.get("target_price", price) for r in results]
-    stops   = [r.get("stop_loss",    price) for r in results]
-    risks   = [r.get("risk_level","medium") for r in results]
+            results = []
+            errors  = []
 
-    avg_bull   = round(sum(bulls)/len(bulls))
-    avg_target = round(sum(targets)/len(targets), 4)
-    avg_stop   = round(sum(stops)/len(stops), 4)
-    bull_votes = sum(1 for b in bulls if b >= 50)
-    bear_votes = sum(1 for t in trends if t == "bearish")
-    bull_trend = sum(1 for t in trends if t == "bullish")
-    risk_order = {"low":0,"medium":1,"high":2,"extreme":3}
-    cons_risk  = max(risks, key=lambda x: risk_order.get(x,1))
+            # Run all engines with enriched data
+            engines_to_run = []
+            if OPENAI_KEY:       engines_to_run.append(("GPT-4o",          lambda: run_gpt4o(symbol, interval, klines, ticker, indicators, fear_greed)))
+            if GROK_KEY:         engines_to_run.append(("Grok-3",           lambda: run_grok2(symbol, interval, klines, ticker, indicators, fear_greed)))
+            if GEMINI_KEY:       engines_to_run.append(("Gemini 2.5 Flash", lambda: run_gemini(symbol, interval, klines, ticker, indicators, fear_greed)))
+            if MISTRAL_KEY:      engines_to_run.append(("Mistral Large",    lambda: run_mistral(symbol, interval, klines, ticker, indicators, fear_greed)))
+            if DEEPSEEK_KEY:     engines_to_run.append(("DeepSeek R1",      lambda: run_deepseek(symbol, interval, klines, ticker, indicators, fear_greed)))
+            if CLAUDE_KEY:       engines_to_run.append(("Claude Haiku 4.5", lambda: run_claude(symbol, interval, klines, ticker, indicators, fear_greed)))
+            if KRONOS_PREDICTOR: engines_to_run.append(("Kronos",           lambda: run_kronos_model(symbol, interval, klines, ticker)))
 
-    if bull_votes == len(results):     agreement = "Strong consensus — all engines bullish"
-    elif bull_votes >= len(results)//2+1: agreement = "Majority bullish"
-    elif bear_votes == len(results):   agreement = "Strong consensus — all engines bearish"
-    elif bear_votes >= len(results)//2+1: agreement = "Majority bearish"
-    else:                              agreement = "Mixed signals — engines disagree"
+            if not engines_to_run:
+                self.send_json({"error":"No engines available. Set GROQ_API_KEY or ANTHROPIC_API_KEY."})
+                return
 
-    combined_analysis = (
-        f"{agreement}. Across {len(results)} engines ({', '.join([r['name'] for r in results])}), "
-        f"average bullish probability is {avg_bull}% with {bull_trend} bullish and {bear_votes} bearish signals. "
-        f"Average target: {avg_target:.4f} · Stop: {avg_stop:.4f} · Risk: {cons_risk.upper()}."
-    )
-    if errors:
-        combined_analysis += f" Note: {'; '.join(errors)}."
+            with ThreadPoolExecutor(max_workers=len(engines_to_run)) as executor:
+                future_to_name = {executor.submit(fn): name for name, fn in engines_to_run}
+                for future in as_completed(future_to_name, timeout=60):
+                    name = future_to_name[future]
+                    try:
+                        r = future.result(timeout=45)
+                        r["name"] = name
+                        results.append(r)
+                    except Exception as e:
+                        errors.append(f"{name}: {e}")
 
-    ms     = MS_MAP[interval]
-    last_t = klines[-1]["t"]
-    # Use first result's forecast candles
-    fc     = results[0].get("forecast_candles",[])
-    fc_len = len(fc)
+            if not results:
+                self.send_json({"error":"All engines failed: " + " | ".join(errors)})
+                return
 
-    return jsonify({
-        "symbol":   symbol,
-        "interval": interval,
-        "price":    price,
-        "chg":      float(ticker["priceChangePercent"]),
-        "vol":      fvol(vol),
-        "high24":   float(ticker["highPrice"]),
-        "low24":    float(ticker["lowPrice"]),
-        "klines":   [{"c":k["c"],"tl":time_label(k["t"],interval)} for k in klines],
-        "fc_times": [time_label(last_t+ms*(i+1),interval) for i in range(fc_len)],
-        "forecast_candles": fc,
-        "engines":  results,
-        "consensus":{
-            "bullish_votes": bull_votes,
-            "total":         len(results),
-            "avg_bullish":   avg_bull,
-            "avg_target":    avg_target,
-            "agreement":     agreement,
-            "risk":          cons_risk,
-            "combined_analysis": combined_analysis,
-        }
-    })
+            # Build consensus
+            bulls   = [r["bullish_probability"] for r in results]
+            trends  = [r.get("trend","neutral") for r in results]
+            targets = [r.get("target_price", float(ticker["lastPrice"])) for r in results]
+            stops   = [r.get("stop_loss",    float(ticker["lastPrice"])) for r in results]
+            risks   = [r.get("risk_level","medium") for r in results]
 
+            avg_bull   = round(sum(bulls)/len(bulls))
+            avg_target = round(sum(targets)/len(targets), 4)
+            avg_stop   = round(sum(stops)/len(stops), 4)
+            bull_votes = sum(1 for b in bulls if b >= 50)
+            bear_votes = sum(1 for t in trends if t == "bearish")
+            bull_trend = sum(1 for t in trends if t == "bullish")
+
+            if bull_votes == len(results):   agreement = "Strong consensus — all engines agree"
+            elif bull_votes >= len(results)//2+1: agreement = "Majority bullish"
+            elif bear_votes == len(results): agreement = "Strong consensus — all engines bearish"
+            elif bear_votes >= len(results)//2+1: agreement = "Majority bearish"
+            else:                            agreement = "Mixed signals — engines disagree"
+
+            risk_order = {"low":0,"medium":1,"high":2,"extreme":3}
+            cons_risk  = max(risks, key=lambda x: risk_order.get(x,1))
+
+            combined_analysis = (
+                f"{agreement}. "
+                f"Across {len(results)} engine{'s' if len(results)>1 else ''} "
+                f"({', '.join([r['name'] for r in results])}), "
+                f"the average bullish probability is {avg_bull}% "
+                f"with {bull_trend} bullish and {bear_votes} bearish trend signals. "
+                f"Average price target: {avg_target:.4f} with stop at {avg_stop:.4f}. "
+                f"Overall risk level: {cons_risk.upper()}."
+            )
+            if errors:
+                combined_analysis += f" Note: {'; '.join(errors)}."
+
+            ms     = MS_MAP[interval]
+            last_t = klines[-1]["t"]
+            # Use Kronos candles if available, else first result
+            kronos_r = next((r for r in results if r["name"]=="Kronos"), results[0])
+            fc_len   = len(kronos_r.get("forecast_candles",[]))
+
+            result = {
+                "symbol":   symbol,
+                "interval": interval,
+                "price":    float(ticker["lastPrice"]),
+                "chg":      float(ticker["priceChangePercent"]),
+                "klines":   [{"c":k["c"],"tl":time_label(k["t"],interval)} for k in klines],
+                "fc_times": [time_label(last_t+ms*(i+1),interval) for i in range(fc_len)],
+                "engines":  results,
+                "consensus": {
+                    "bullish_votes": bull_votes,
+                    "total":         len(results),
+                    "avg_bullish":   avg_bull,
+                    "avg_target":    avg_target,
+                    "avg_stop":      avg_stop,
+                    "agreement":     agreement,
+                    "risk":          cons_risk,
+                    "combined_analysis": combined_analysis,
+                }
+            }
+            self.send_json(result)
+            return
+
+        if parsed.path == "/forecast":
+            params   = urllib.parse.parse_qs(parsed.query)
+            symbol   = params.get("symbol",  ["BTCUSDT"])[0].upper()
+            interval = params.get("interval",["15m"])[0]
+            engine   = params.get("engine",  ["gpt4o"])[0]
+
+            if engine == "gpt4o" and not OPENAI_KEY:
+                self.send_json({"error":"OPENAI_API_KEY not set. Run: setx OPENAI_API_KEY sk-... then restart."})
+                return
+            if engine == "grok2" and not GROK_KEY:
+                self.send_json({"error":"XAI_API_KEY not set. Run: setx XAI_API_KEY xai-... then restart."})
+                return
+            if engine == "gemini" and not GEMINI_KEY:
+                self.send_json({"error":"GEMINI_API_KEY not set. Run: setx GEMINI_API_KEY AI... then restart."})
+                return
+            if engine == "mistral" and not MISTRAL_KEY:
+                self.send_json({"error":"MISTRAL_API_KEY not set. Run: setx MISTRAL_API_KEY ... then restart."})
+                return
+            if engine == "deepseek" and not DEEPSEEK_KEY:
+                self.send_json({"error":"DEEPSEEK_API_KEY not set. Run: setx DEEPSEEK_API_KEY sk-... then restart."})
+                return
+            if engine == "claude" and not CLAUDE_KEY:
+                self.send_json({"error":"ANTHROPIC_API_KEY not set. Run: setx ANTHROPIC_API_KEY sk-ant-... then restart."})
+                return
+            if engine == "kronos" and not KRONOS_PREDICTOR:
+                self.send_json({"error":"Kronos model not loaded. Make sure C:/kronos/model and C:/kronos/code exist."})
+                return
+
+            try:
+                klines = fetch_klines(symbol, interval)
+                ticker = fetch_ticker(symbol)
+            except Exception as e:
+                self.send_json({"error":f"Data fetch failed: {e}"})
+                return
+
+            indicators = calc_indicators(klines)
+            fear_greed = fetch_fear_greed()
+
+            try:
+                if engine == "gpt4o":
+                    analysis = run_gpt4o(symbol, interval, klines, ticker, indicators, fear_greed)
+                elif engine == "grok2":
+                    analysis = run_grok2(symbol, interval, klines, ticker, indicators, fear_greed)
+                elif engine == "gemini":
+                    analysis = run_gemini(symbol, interval, klines, ticker, indicators, fear_greed)
+                elif engine == "mistral":
+                    analysis = run_mistral(symbol, interval, klines, ticker, indicators, fear_greed)
+                elif engine == "deepseek":
+                    analysis = run_deepseek(symbol, interval, klines, ticker, indicators, fear_greed)
+                elif engine == "claude":
+                    analysis = run_claude(symbol, interval, klines, ticker, indicators, fear_greed)
+                elif engine == "kronos":
+                    analysis = run_kronos_model(symbol, interval, klines, ticker)
+                else:
+                    self.send_json({"error":f"Unknown engine: {engine}"})
+                    return
+            except Exception as e:
+                print(f"[ERROR] {engine} failed: {e}")
+                self.send_json({"error":f"AI analysis failed for {engine}. Check server logs."})
+                return
+
+            ms     = MS_MAP[interval]
+            last_t = klines[-1]["t"]
+            fc_len = len(analysis.get("forecast_candles",[]))
+
+            result = {
+                "symbol":   symbol,
+                "interval": interval,
+                "iv_label": IV_LABEL[interval],
+                "engine": {"gpt4o":"GPT-4o","grok2":"Grok-3","gemini":"Gemini 2.5 Flash","mistral":"Mistral Large","deepseek":"DeepSeek R1","claude":"Claude Haiku 4.5","kronos":"Kronos-base 102M"}.get(engine, engine),
+                "price":    float(ticker["lastPrice"]),
+                "chg":      float(ticker["priceChangePercent"]),
+                "vol":      float(ticker["quoteVolume"]),
+                "high24":   float(ticker["highPrice"]),
+                "low24":    float(ticker["lowPrice"]),
+                "klines":   [{"c":k["c"],"tl":time_label(k["t"],interval)} for k in klines],
+                "fc_times": [time_label(last_t+ms*(i+1),interval) for i in range(fc_len)],
+                "analysis": analysis,
+            }
+            self.send_json(result)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    print(f"\n  {'━'*44}")
+    print(f"  KRONOS WEB APP — ALL ENGINES + ENRICHED DATA")
+    print(f"  {'━'*44}")
+    if OPENAI_KEY:   print(f"  GPT-4o         : OK (+ web search)")
+    else:            print(f"  GPT-4o         : NOT SET (setx OPENAI_API_KEY sk-...)")
+    if GROK_KEY:     print(f"  Grok-3         : OK (+ X/Twitter search)")
+    else:            print(f"  Grok-3         : NOT SET (setx XAI_API_KEY xai-...)")
+    if GEMINI_KEY:   print(f"  Gemini 2.5     : OK")
+    else:            print(f"  Gemini 2.5     : NOT SET (setx GEMINI_API_KEY AI...)")
+    if MISTRAL_KEY:  print(f"  Mistral Large  : OK")
+    else:            print(f"  Mistral Large  : NOT SET (setx MISTRAL_API_KEY ...)")
+    if DEEPSEEK_KEY: print(f"  DeepSeek R1    : OK")
+    else:            print(f"  DeepSeek R1    : NOT SET (setx DEEPSEEK_API_KEY sk-...)")
+    if CLAUDE_KEY:   print(f"  Claude Haiku   : OK")
+    else:            print(f"  Claude Haiku   : NOT SET (setx ANTHROPIC_API_KEY sk-ant-...)")
+    print(f"  Fear & Greed   : auto-fetched per request")
+    print(f"  Indicators     : RSI, MACD, BB, ATR, Volume (pre-calculated)")
+    print(f"  Loading Kronos-base model (may take 30 seconds)...")
+    load_kronos_model()
+    print(f"  {'━'*44}")
+    print(f"  Open in browser: http://localhost:{PORT}")
+    print(f"  Press Ctrl+C to stop")
+    print(f"  {'━'*44}\n")
+
+    threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    server = HTTPServer(("localhost", PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Server stopped.\n")
