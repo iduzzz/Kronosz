@@ -78,17 +78,27 @@ def run_grok(symbol, interval, klines, ticker):
 
 def run_gemini(symbol, interval, klines, ticker):
     system, user = build_prompt(symbol, interval, klines, ticker)
-    r = req.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-        headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_KEY},
-        json={"system_instruction":{"parts":[{"text":system}]},
-              "contents":[{"role":"user","parts":[{"text":user}]}],
-              "generationConfig":{"temperature":0.25,"maxOutputTokens":8192}},timeout=60)
-    if not r.ok: raise Exception(f"Gemini {r.status_code}: {r.text[:300]}")
-    raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-    raw = raw.replace("```json","").replace("```","").strip()
-    start = raw.find("{"); end = raw.rfind("}")+1
-    return json.loads(raw[start:end] if start>=0 and end>start else raw)
+    # Try 2.5-flash first, fall back to 2.0-flash
+    for model in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        try:
+            r = req.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_KEY},
+                json={"system_instruction":{"parts":[{"text":system}]},
+                      "contents":[{"role":"user","parts":[{"text":user}]}],
+                      "generationConfig":{"temperature":0.25,"maxOutputTokens":8192}},
+                timeout=60)
+            if not r.ok:
+                continue
+            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            raw = raw.replace("```json","").replace("```","").strip()
+            start = raw.find("{"); end = raw.rfind("}")+1
+            result = json.loads(raw[start:end] if start>=0 and end>start else raw)
+            result["_model"] = model
+            return result
+        except Exception:
+            continue
+    raise Exception(f"Gemini failed on all models. Key starts with: {GEMINI_KEY[:8] if GEMINI_KEY else 'NOT SET'}")
 
 def run_claude(symbol, interval, klines, ticker):
     system, user = build_prompt(symbol, interval, klines, ticker)
@@ -307,6 +317,16 @@ function renderDashboard(d){
 </html>"""
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
+@app.route("/status")
+def status():
+    return jsonify({
+        "OPENAI_API_KEY":  "OK" if OPENAI_KEY else "MISSING",
+        "XAI_API_KEY":     "OK" if GROK_KEY   else "MISSING",
+        "GEMINI_API_KEY":  "OK" if GEMINI_KEY  else "MISSING",
+        "ANTHROPIC_API_KEY":"OK" if CLAUDE_KEY  else "MISSING",
+        "gemini_key_start": GEMINI_KEY[:8] if GEMINI_KEY else "NOT SET",
+    })
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
